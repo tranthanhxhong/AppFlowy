@@ -379,7 +379,9 @@ pub(crate) async fn update_row_meta_handler(
   let params: UpdateRowMetaParams = data.into_inner().try_into()?;
   let database_editor = manager.get_database_with_view_id(&params.view_id).await?;
   let row_id = RowId::from(params.id.clone());
-  database_editor.update_row_meta(&row_id, params).await;
+  database_editor
+    .update_row_meta(&row_id.clone(), params)
+    .await;
   Ok(())
 }
 
@@ -528,20 +530,6 @@ pub(crate) async fn delete_select_option_handler(
     )
     .await?;
   Ok(())
-}
-
-#[tracing::instrument(level = "trace", skip(data, manager), err)]
-pub(crate) async fn get_select_option_handler(
-  data: AFPluginData<CellIdPB>,
-  manager: AFPluginState<Weak<DatabaseManager>>,
-) -> DataResult<SelectOptionCellDataPB, FlowyError> {
-  let manager = upgrade_manager(manager)?;
-  let params: CellIdParams = data.into_inner().try_into()?;
-  let database_editor = manager.get_database_with_view_id(&params.view_id).await?;
-  let options = database_editor
-    .get_select_options(params.row_id, &params.field_id)
-    .await;
-  data_result_ok(options)
 }
 
 #[tracing::instrument(level = "trace", skip_all, err)]

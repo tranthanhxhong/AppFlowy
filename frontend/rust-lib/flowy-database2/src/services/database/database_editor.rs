@@ -10,7 +10,7 @@ use crate::services::database_view::{
 use crate::services::field::{
   default_type_option_data_from_type, select_type_option_from_field, transform_type_option,
   type_option_data_from_pb, ChecklistCellChangeset, RelationTypeOption, SelectOptionCellChangeset,
-  SelectOptionIds, StrCellData, TimestampCellData, TypeOptionCellDataHandler, TypeOptionCellExt,
+  StrCellData, TimestampCellData, TypeOptionCellDataHandler, TypeOptionCellExt,
 };
 use crate::services::field_settings::{
   default_field_settings_by_layout_map, FieldSettings, FieldSettingsChangesetParams,
@@ -32,6 +32,7 @@ use lib_dispatch::prelude::af_spawn;
 use lib_infra::box_any::BoxAny;
 use lib_infra::future::{to_fut, Fut, FutureResult};
 use lib_infra::priority_task::TaskDispatcher;
+use lib_infra::util::timestamp;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -405,16 +406,16 @@ impl DatabaseEditor {
         }
 
         let old_field_type = FieldType::from(field.field_type);
-        let old_type_option = field.get_any_type_option(old_field_type);
-        let new_type_option = field
+        let old_type_option_data = field.get_any_type_option(old_field_type);
+        let new_type_option_data = field
           .get_any_type_option(new_field_type)
           .unwrap_or_else(|| default_type_option_data_from_type(new_field_type));
 
         let transformed_type_option = transform_type_option(
-          &new_type_option,
-          new_field_type,
-          old_type_option,
           old_field_type,
+          new_field_type,
+          old_type_option_data,
+          new_type_option_data,
         );
         self
           .database
@@ -710,6 +711,11 @@ impl DatabaseEditor {
       send_notification(row_id.as_str(), DatabaseNotification::DidUpdateRowMeta)
         .payload(RowMetaPB::from(&row_detail))
         .send();
+
+      // Update the last modified time of the row
+      self
+        .update_last_modified_time(row_detail.clone(), &changeset.view_id)
+        .await;
     }
   }
 
@@ -800,6 +806,26 @@ impl DatabaseEditor {
     self.update_cell(view_id, row_id, field_id, new_cell).await
   }
 
+  async fn update_last_modified_time(&self, row_detail: RowDetail, view_id: &str) {
+    self
+      .database
+      .lock()
+      .update_row(&row_detail.row.id, |row_update| {
+        row_update.set_last_modified(timestamp());
+      });
+
+    let editor = self.database_views.get_view_editor(view_id).await;
+    if let Ok(editor) = editor {
+      editor
+        .v_did_update_row(&Some(row_detail.clone()), &row_detail, None)
+        .await;
+    }
+
+    self
+      .notify_update_row(view_id, row_detail.row.id, vec![])
+      .await;
+  }
+
   /// Update a cell in the database.
   /// This will notify all views that the cell has been updated.
   pub async fn update_cell(
@@ -853,7 +879,7 @@ impl DatabaseEditor {
     if let Some(new_row_detail) = option_row {
       for view in self.database_views.editors().await {
         view
-          .v_did_update_row(&old_row, &new_row_detail, field_id.to_owned())
+          .v_did_update_row(&old_row, &new_row_detail, Some(field_id.to_owned()))
           .await;
       }
     }
@@ -987,24 +1013,6 @@ impl DatabaseEditor {
       .update_cell_with_changeset(view_id, row_id, field_id, BoxAny::new(cell_changeset))
       .await?;
     Ok(())
-  }
-
-  pub async fn get_select_options(&self, row_id: RowId, field_id: &str) -> SelectOptionCellDataPB {
-    let field = self.database.lock().fields.get_field(field_id);
-    match field {
-      None => SelectOptionCellDataPB::default(),
-      Some(field) => {
-        let cell = self.database.lock().get_cell(field_id, &row_id).cell;
-        let ids = match cell {
-          None => SelectOptionIds::new(),
-          Some(cell) => SelectOptionIds::from(&cell),
-        };
-        match select_type_option_from_field(&field) {
-          Ok(type_option) => type_option.get_selected_options(ids).into(),
-          Err(_) => SelectOptionCellDataPB::default(),
-        }
-      },
-    }
   }
 
   pub async fn set_checklist_options(
@@ -1323,7 +1331,7 @@ impl DatabaseEditor {
   ) -> FlowyResult<Vec<RelatedRowDataPB>> {
     let primary_field = self.database.lock().fields.get_primary_field().unwrap();
     let handler = TypeOptionCellExt::new(&primary_field, Some(self.cell_cache.clone()))
-      .get_type_option_cell_data_handler(&FieldType::RichText)
+      .get_type_option_cell_data_handler_with_field_type(FieldType::RichText)
       .ok_or(FlowyError::internal())?;
 
     let row_data = {
@@ -1338,11 +1346,7 @@ impl DatabaseEditor {
           let title = database
             .get_cell(&primary_field.id, &row.id)
             .cell
-            .and_then(|cell| {
-              handler
-                .get_cell_data(&cell, &FieldType::RichText, &primary_field)
-                .ok()
-            })
+            .and_then(|cell| handler.handle_get_boxed_cell_data(&cell, &primary_field))
             .and_then(|cell_data| cell_data.unbox_or_none())
             .unwrap_or_else(|| StrCellData("".to_string()));
 
@@ -1689,10 +1693,8 @@ impl DatabaseViewOperation for DatabaseViewOperationImpl {
   fn get_type_option_cell_handler(
     &self,
     field: &Field,
-    field_type: &FieldType,
   ) -> Option<Box<dyn TypeOptionCellDataHandler>> {
-    TypeOptionCellExt::new(field, Some(self.cell_cache.clone()))
-      .get_type_option_cell_data_handler(field_type)
+    TypeOptionCellExt::new(field, Some(self.cell_cache.clone())).get_type_option_cell_data_handler()
   }
 
   fn get_field_settings(
